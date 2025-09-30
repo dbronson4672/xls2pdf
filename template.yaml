@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless application for converting XLSX payloads to PDF using the Adobe web services toolkit.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Handler: app.lambda_handler
+    Timeout: 180
+    MemorySize: 2048
+    Architectures:
+      - x86_64
+    Tracing: Active
+    Layers:
+      - !Ref AdobePythonLayerArn
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Default S3 bucket containing XLSX source objects when the payload references an s3:// path.
+  TargetBucketName:
+    Type: String
+    Description: Default S3 bucket to write generated PDF files when the payload omits an explicit S3 target path.
+  AdobePythonLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /layers/shared/adobe-python/arn
+    Description: ARN for the shared Adobe Python Lambda layer stored in SSM Parameter Store.
+
+Resources:
+  
+  ConvertToPdfBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'xlsx-to-pdf'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  XLSToPDF:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-xls-to-pdf
+      Description: Convert XLSX payloads to PDF using the Adobe web services toolkit either synchronously via API or asynchronously via SQS.
+      CodeUri: src/
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ConvertToPdfBucket
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::*
+              - !Sub arn:${AWS::Partition}:s3:::*/*
+      Environment:
+        Variables:
+          ADOBE_TOOLKIT_LAYER_ARN: !Ref AdobePythonLayerArn
+
+      Events:
+        ApiInvocation:
+          Type: Api
+          Properties:
+            Path: /xls-to-pdf
+            Method: post
+
+Outputs:
+  ApiInvokeUrl:
+    Description: API endpoint for synchronous XLSX to PDF conversions.
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/convert

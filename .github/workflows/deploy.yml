@@ -1,0 +1,118 @@
+name: Validate, Build, and Deploy SAM Application
+
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+  workflow_dispatch:
+    inputs:
+      stack-name:
+        description: AWS CloudFormation stack name
+        required: false
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  SAM_CLI_TELEMETRY: 0
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+    
+    - name: Install validation tools
+      run: |
+        pip install cfn-lint aws-sam-cli
+        
+    - name: Validate SAM Template
+      env:
+        AWS_REGION: ${{ env.AWS_REGION }}
+        AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+      run: |
+        sam validate --template template.yaml --region "$AWS_DEFAULT_REGION"
+        cfn-lint template.yaml
+
+  build-deploy:
+    needs: validate
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Python and SAM
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+    - run: pip install aws-sam-cli
+
+    - name: Set deployment environment
+      id: set-env
+      run: |
+        if [[ "${GITHUB_REF}" == "refs/heads/develop" ]]; then
+          echo "DEPLOY_ENV=staging" >> $GITHUB_ENV
+        elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+          echo "DEPLOY_ENV=production" >> $GITHUB_ENV
+        fi
+
+    - name: Configure AWS credentials (staging)
+      if: github.ref == 'refs/heads/develop'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Configure AWS credentials (production)
+      if: github.ref == 'refs/heads/main'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: SAM Build Layers
+      run: sam build --template template.yaml --use-container --parallel
+
+    - name: SAM Deploy
+      env:
+        DEPLOY_ENV: ${{ env.DEPLOY_ENV }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ env.AWS_REGION }}
+        AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+      run: |
+        echo "Deploying with config env: $DEPLOY_ENV"
+        sam deploy \
+          --config-env "$DEPLOY_ENV" \
+          --stack-name "aws-common-layers-$DEPLOY_ENV" \
+          --region "$AWS_DEFAULT_REGION" \
+          --resolve-s3 \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset
+
+  notify:
+    needs: [build-deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Notify deployment status
+      run: |
+        if [[ "${{ needs.build-deploy.result }}" == "success" ]]; then
+          echo "✅ Deployment successful"
+        elif [[ "${{ needs.build-deploy.result }}" == "skipped" ]]; then
+          echo "ℹ️ Deployment skipped (non-deploy event/branch)"
+        else
+          echo "❌ Deployment failed"
+          exit 1
+        fi
