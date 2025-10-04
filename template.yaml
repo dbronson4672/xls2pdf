@@ -13,26 +13,69 @@ Globals:
       - x86_64
     Tracing: Active
     Layers:
-      - !Ref AdobePythonLayerArn
+      - !If
+        - UseExternalAdobeLayer
+        - !Ref AdobePythonLayerArn
+        - !Ref AdobePdfServicesLayer
 
 Parameters:
-  SourceBucketName:
-    Type: String
-    Description: Default S3 bucket containing XLSX source objects when the payload references an s3:// path.
-  TargetBucketName:
-    Type: String
-    Description: Default S3 bucket to write generated PDF files when the payload omits an explicit S3 target path.
   AdobePythonLayerArn:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /layers/shared/adobe-python/arn
-    Description: ARN for the shared Adobe Python Lambda layer stored in SSM Parameter Store.
+    Type: String
+    Default: ""
+    Description: Optional ARN for an external Adobe PDF Services Python layer.
+  ApiStage:
+    Type: String
+    Default: Prod
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    Description: Stage name for the API Gateway deployment.
+  PDFServicesClientIdParameterPath:
+    Type: String
+    Default: /pdfservices/client/id
+    Description: SSM parameter path containing the Adobe PDF Services client identifier.
+  PDFServicesClientSecretParameterPath:
+    Type: String
+    Default: /pdfservices/client/secret
+    Description: SSM parameter path containing the Adobe PDF Services client secret.
+
+  UseSharedAdobePythonLayer:
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Default: false
+    Description: Toggle to force usage of the shared Adobe Python layer instead of the bundled layer.
+
+Conditions:
+  UseExternalAdobeLayer: !Equals [!Ref UseSharedAdobePythonLayer, 'true']
 
 Resources:
-  
-  ConvertToPdfBucket:
+
+  AdobePdfServicesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-adobe-pdfservices
+      Description: Bundled Adobe PDF Services SDK v4 for Python.
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.13
+        - python3.12
+        - python3.11
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.13
+
+  XLSToPDFApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: !Ref ApiStage
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+
+  XLSToPDFDropzoneBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub 'xlsx-to-pdf'
+      BucketName: 'xlsx-to-pdf-dropzone'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -47,27 +90,35 @@ Resources:
       CodeUri: src/
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref ConvertToPdfBucket
+            BucketName: !Ref XLSToPDFDropzoneBucket
         - Statement:
-            Effect: Allow
-            Action:
-              - s3:GetObject
-              - s3:PutObject
-            Resource:
-              - !Sub arn:${AWS::Partition}:s3:::*
-              - !Sub arn:${AWS::Partition}:s3:::*/*
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PDFServicesClientIdParameterPath}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PDFServicesClientSecretParameterPath}
       Environment:
         Variables:
-          ADOBE_TOOLKIT_LAYER_ARN: !Ref AdobePythonLayerArn
-
+          PDF_SERVICES_CLIENT_ID_PARAMETER: !Ref PDFServicesClientIdParameterPath
+          PDF_SERVICES_CLIENT_SECRET_PARAMETER: !Ref PDFServicesClientSecretParameterPath
       Events:
         ApiInvocation:
           Type: Api
           Properties:
+            RestApiId: !Ref XLSToPDFApi
+            Stage: !Ref ApiStage
             Path: /xls-to-pdf
             Method: post
 
 Outputs:
   ApiInvokeUrl:
     Description: API endpoint for synchronous XLSX to PDF conversions.
-    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/convert
+    Value:
+      !Sub
+        - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/xls-to-pdf
+        - ApiId: !Ref XLSToPDFApi
+          Stage: !Ref ApiStage
+  ApiId:
+    Description: API Gateway ID backing the synchronous endpoint.
+    Value: !Ref XLSToPDFApi

@@ -3,23 +3,33 @@ import json
 import logging
 import os
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
-from adobe.pdfservices.operation.auth.credentials import Credentials
-from adobe.pdfservices.operation.execution_context import ExecutionContext
-from adobe.pdfservices.operation.io.file_ref import FileRef
-from adobe.pdfservices.operation.pdfops.create_pdf_operation import CreatePDFOperation
+try:
+    from adobe.pdfservices.operation.auth.service_principal_credentials import ServicePrincipalCredentials
+    from adobe.pdfservices.operation.exception.exceptions import ServiceApiException, ServiceUsageException, SdkException
+    from adobe.pdfservices.operation.io.cloud_asset import CloudAsset
+    from adobe.pdfservices.operation.io.stream_asset import StreamAsset
+    from adobe.pdfservices.operation.pdf_services import PDFServices
+    from adobe.pdfservices.operation.pdf_services_media_type import PDFServicesMediaType
+    from adobe.pdfservices.operation.pdfjobs.jobs.create_pdf_job import CreatePDFJob
+    from adobe.pdfservices.operation.pdfjobs.result.create_pdf_result import CreatePDFResult
+    
+except ImportError as exc:
+    raise RuntimeError(
+        "pdfservices-sdk v4 is required but not available; ensure it is included in the Lambda layer or deployment package."
+    ) from exc
 
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
 
 S3_CLIENT = boto3.client("s3")
+SSM_CLIENT = boto3.client("ssm")
 
 PDF_CONTENT_TYPE = "application/pdf"
 SUPPORTED_INPUT_FORMAT = "xlsx"
@@ -50,38 +60,80 @@ class AdobeWorkbookConverter:
     """Wraps Adobe PDF Services SDK for converting Excel workbooks to PDF."""
 
     def __init__(self) -> None:
-        credentials = self._load_credentials()
-        self._execution_context = ExecutionContext.create(credentials)
+        self._pdf_services = self._initialise_client()
 
     def convert(self, workbook_path: str) -> bytes:
         """Convert a workbook at the provided path into PDF bytes."""
-        operation = CreatePDFOperation.create_new()
-        operation.set_input(FileRef.create_from_local_file(workbook_path))
-
-        LOGGER.info("Running Adobe conversion for workbook '%s'", workbook_path)
-        result = operation.execute(self._execution_context)
-
-        tmp_pdf = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.pdf"
-        result.save_as(tmp_pdf)
         try:
-            return tmp_pdf.read_bytes()
-        finally:
-            tmp_pdf.unlink(missing_ok=True)
+            with open(workbook_path, "rb") as handle:
+                workbook_bytes = handle.read()
+        except OSError as exc:  # pragma: no cover - unexpected filesystem faults
+            raise ConversionError(f"Unable to read workbook at {workbook_path}") from exc
+
+        try:
+            LOGGER.info("Running Adobe conversion for workbook '%s'", workbook_path)
+            input_asset = self._pdf_services.upload(
+                input_stream=workbook_bytes,
+                mime_type=PDFServicesMediaType.XLSX,
+            )
+            create_pdf_job = CreatePDFJob(input_asset)
+            location = self._pdf_services.submit(create_pdf_job)
+            job_result = self._pdf_services.get_job_result(location, CreatePDFResult)
+            result_asset = job_result.get_result().get_asset()
+            stream_asset = self._pdf_services.get_content(result_asset)
+            pdf_stream = stream_asset.get_input_stream()
+        except Exception as exc:  # pragma: no cover - SDK surface raises many exception types
+            raise ConversionError("Adobe PDF Services conversion failed") from exc
+
+        if hasattr(pdf_stream, "read"):
+            pdf_bytes = pdf_stream.read()
+        else:
+            pdf_bytes = pdf_stream
+
+        if not isinstance(pdf_bytes, (bytes, bytearray)):
+            raise ConversionError("Adobe PDF Services returned unexpected content type")
+
+        return bytes(pdf_bytes)
 
     @staticmethod
-    def _load_credentials() -> Credentials:
-        credentials_path = os.getenv("ADOBE_CREDENTIALS_PATH")
-        if credentials_path and os.path.exists(credentials_path):
-            LOGGER.info("Loading Adobe credentials from %s", credentials_path)
-            return (
-                Credentials.service_account_credentials_builder()
-                .from_file(credentials_path)
-                .build()
-            )
-
-        raise ConversionError(
-            "Unable to initialise Adobe credentials; set ADOBE_CREDENTIALS_PATH to a valid file in the layer."
+    def _initialise_client() -> PDFServices:
+        client_id = _resolve_secret_value(
+            value_env="PDF_SERVICES_CLIENT_ID",
+            parameter_env="PDF_SERVICES_CLIENT_ID_PARAMETER",
+            secret_label="client identifier",
         )
+        client_secret = _resolve_secret_value(
+            value_env="PDF_SERVICES_CLIENT_SECRET",
+            parameter_env="PDF_SERVICES_CLIENT_SECRET_PARAMETER",
+            secret_label="client secret",
+        )
+
+        credentials = ServicePrincipalCredentials(client_id=client_id, client_secret=client_secret)
+
+        return PDFServices(credentials=credentials)
+
+
+def _resolve_secret_value(*, value_env: str, parameter_env: str, secret_label: str) -> str:
+    direct_value = os.getenv(value_env)
+    if direct_value:
+        return direct_value
+
+    parameter_name = os.getenv(parameter_env)
+    if not parameter_name:
+        raise ConversionError(
+            f"PDF Services {secret_label} is not configured; set {value_env} or {parameter_env}."
+        )
+
+    try:
+        response = SSM_CLIENT.get_parameter(Name=parameter_name, WithDecryption=True)
+    except ClientError as exc:
+        raise ConversionError(f"Unable to resolve {secret_label} from SSM parameter '{parameter_name}'") from exc
+
+    value = response.get("Parameter", {}).get("Value")
+    if not value:
+        raise ConversionError(f"Retrieved empty {secret_label} from SSM parameter '{parameter_name}'")
+
+    return value
 
 
 _converter: Optional[AdobeWorkbookConverter] = None
