@@ -234,13 +234,22 @@ def _process_payload(
     finally:
         Path(workbook_path).unlink(missing_ok=True)
 
-    target_location = _resolve_target(payload.get("target"), filename)
-    _write_pdf_to_s3(pdf_bytes, target_location)
+    target_value = payload.get("target")
+    pdf_name = f"{Path(filename).stem}.pdf"
+    target_location: Optional[S3Location] = None
+    if not (return_pdf and _is_blank_string(target_value)):
+        target_location = _resolve_target(target_value, filename)
+        _write_pdf_to_s3(pdf_bytes, target_location)
+        target_descriptor = target_location.uri
+        output_filename = Path(target_location.key).name
+    else:
+        target_descriptor = ""
+        output_filename = pdf_name
 
     metadata = {
         "source": source_descriptor,
-        "target": target_location.uri,
-        "filename": Path(target_location.key).name,
+        "target": target_descriptor,
+        "filename": output_filename,
         "invocation": invocation_source,
     }
 
@@ -357,3 +366,7 @@ def _is_sqs_event(event: Dict[str, Any]) -> bool:
 
 def _is_api_event(event: Dict[str, Any]) -> bool:
     return "httpMethod" in event or "requestContext" in event
+
+
+def _is_blank_string(value: Optional[str]) -> bool:
+    return isinstance(value, str) and not value.strip()
