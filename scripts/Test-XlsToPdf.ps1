@@ -1,57 +1,40 @@
-# Harness to encode an XLSX workbook and exercise the xls2pdf Lambda/API.
+# Harness to encode an XLSX workbook, submit it to the async API, and optionally poll for the PDF.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$InputFile,
 
-    [string]$Target,
+    [string]$SubmitUrl,
 
-    [string]$ApiUrl,
+    [string]$GetUrl,
+
+    [string]$ResultKey,
+
+    [int]$MaxAttempts = 12,
+
+    [int]$DelaySeconds = 5,
 
     [string]$OutputPdf,
 
-    [string]$EventOutput,
-
-    [ValidateSet('api', 'sqs')]
-    [string]$EventType = 'api'
+    [string]$EventOutput
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function New-ApiEvent {
+function New-SubmitApiEvent {
     param(
         [string]$BodyJson
     )
 
     return @{
-        resource        = '/xls-to-pdf'
-        path            = '/xls-to-pdf'
+        resource        = '/submit'
+        path            = '/submit'
         httpMethod      = 'POST'
         headers         = @{ 'Content-Type' = 'application/json' }
         isBase64Encoded = $false
         body            = $BodyJson
     }
-}
-
-function New-SqsEvent {
-    param(
-        [string]$BodyJson
-    )
-
-    $record = @{
-        messageId         = [guid]::NewGuid().ToString()
-        receiptHandle     = 'placeholder-handle'
-        body              = $BodyJson
-        attributes        = @{}
-        messageAttributes = @{}
-        md5OfBody         = ''
-        eventSource       = 'aws:sqs'
-        eventSourceARN    = 'arn:aws:sqs:us-east-1:123456789012:xls2pdf-test'
-        awsRegion         = 'us-east-1'
-    }
-
-    return @{ Records = @($record) }
 }
 
 function Test-IsLikelyBase64Bytes {
@@ -82,6 +65,14 @@ if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
     throw "Input file '$InputFile' not found."
 }
 
+if ($MaxAttempts -lt 1) {
+    throw "MaxAttempts must be at least 1."
+}
+
+if ($DelaySeconds -lt 0) {
+    throw "DelaySeconds cannot be negative."
+}
+
 $resolvedInput = (Resolve-Path -LiteralPath $InputFile).ProviderPath
 $fileName = [System.IO.Path]::GetFileName($resolvedInput)
 
@@ -99,38 +90,94 @@ $payload = [ordered]@{
     data     = $base64Data
 }
 
-if ($Target) {
-    $payload['target'] = $Target
-}
-
 $payloadJson = $payload | ConvertTo-Json -Depth 6 -Compress
 
 if ($EventOutput) {
-    $event = if ($EventType -eq 'sqs') {
-        New-SqsEvent -BodyJson $payloadJson
-    }
-    else {
-        New-ApiEvent -BodyJson $payloadJson
-    }
-
+    $event = New-SubmitApiEvent -BodyJson $payloadJson
     $eventJson = $event | ConvertTo-Json -Depth 6
     $eventPath = [System.IO.Path]::GetFullPath($EventOutput)
     [System.IO.File]::WriteAllText($eventPath, $eventJson)
-    Write-Host "Wrote sample $EventType event to $eventPath"
+    Write-Host "Wrote sample submit event to $eventPath"
 }
 
-if ($ApiUrl) {
-    if (-not $OutputPdf) {
-        $folder = [System.IO.Path]::GetDirectoryName($resolvedInput)
-        $stem = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInput)
-        $OutputPdf = [System.IO.Path]::Combine($folder, "$stem.pdf")
+$resultId = $ResultKey
+
+if (-not $resultId -and $SubmitUrl) {
+    Write-Host "Submitting workbook to $SubmitUrl"
+    $submitResponse = Invoke-WebRequest -Uri $SubmitUrl -Method Post -ContentType 'application/json' -Body $payloadJson
+    $submitBody = $submitResponse.Content.Trim()
+    if (-not $submitBody.StartsWith('{')) {
+        throw 'Submit API returned a non-JSON response.'
     }
 
-    Write-Host "Invoking API $ApiUrl"
-    # $response = Invoke-WebRequest -Verbose -Uri $ApiUrl -Method Post -ContentType 'application/json' -Body $payloadJson
-    $response = Invoke-WebRequest -Uri $ApiUrl -Method Post -ContentType 'application/json' -Body $payloadJson
-    $pdfBytes = $null
+    try {
+        $submitJson = $submitBody | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Unable to parse submit response: $($_.Exception.Message)"
+    }
+
+    if ($submitJson.error) {
+        throw "Submit API returned an error: $($submitJson.error)"
+    }
+
+    if ($submitJson.status -ne 'submitted') {
+        throw "Submit API returned unexpected status '$($submitJson.status)'"
+    }
+
+    if (-not $submitJson.result) {
+        throw 'Submit API response did not include a result identifier.'
+    }
+
+    $resultId = $submitJson.result
+    Write-Host "Result key: $resultId"
+}
+
+if (-not $resultId) {
+    Write-Host 'No submit call was made and no result identifier supplied; nothing further to do.'
+    if (-not $SubmitUrl) {
+        Write-Host $payloadJson
+    }
+    return
+}
+
+if (-not $GetUrl) {
+    Write-Host "Result identifier: $resultId"
+    return
+}
+
+if (-not $OutputPdf) {
+    $folder = [System.IO.Path]::GetDirectoryName($resolvedInput)
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInput)
+    $OutputPdf = [System.IO.Path]::Combine($folder, "$stem.pdf")
+}
+
+$pollUriBase = if ($GetUrl.Contains('?')) { "$GetUrl&result=" } else { "$GetUrl?result=" }
+$attempt = 0
+$downloaded = $false
+
+while ($attempt -lt $MaxAttempts -and -not $downloaded) {
+    $attempt++
+    $pollUri = "$pollUriBase$resultId"
+    Write-Host "Polling attempt $attempt: $pollUri"
+
+    try {
+        $response = Invoke-WebRequest -Uri $pollUri -Method Get
+    }
+    catch {
+        if ($attempt -ge $MaxAttempts) {
+            throw "GET request failed on final attempt: $($_.Exception.Message)"
+        }
+        Write-Warning "GET request failed: $($_.Exception.Message). Retrying after $DelaySeconds seconds."
+        if ($DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+        continue
+    }
+
     $contentType = $response.Headers['Content-Type']
+    $pdfBytes = $null
+
     if ($contentType -and $contentType[0] -like 'application/pdf*') {
         $memoryStream = New-Object System.IO.MemoryStream
         $response.RawContentStream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
@@ -142,22 +189,34 @@ if ($ApiUrl) {
         if ($bodyText.StartsWith('{')) {
             try {
                 $jsonBody = $bodyText | ConvertFrom-Json -ErrorAction Stop
-                if ($jsonBody.error) {
-                    throw "API returned an error: $($jsonBody.error)"
-                }
-                throw 'Unexpected JSON response from API; no PDF content located.'
             }
             catch {
-                throw $_
+                throw "Unable to parse GET response JSON: $($_.Exception.Message)"
             }
+
+            if ($jsonBody.error) {
+                throw "GET API returned an error: $($jsonBody.error)"
+            }
+
+            if ($jsonBody.status -eq 'inprogress' -or $jsonBody.status -eq 'submitted') {
+                Write-Host "Status: $($jsonBody.status). Waiting $DelaySeconds seconds before retrying."
+                if ($DelaySeconds -gt 0) {
+                    Start-Sleep -Seconds $DelaySeconds
+                }
+                continue
+            }
+
+            throw "Unexpected JSON response from GET API: $($jsonBody | ConvertTo-Json -Compress)"
         }
 
-        $sanitised = $bodyText.Trim('"').Replace("`n", '').Replace("`r", '')
-        try {
-            $pdfBytes = [System.Convert]::FromBase64String($sanitised)
-        }
-        catch {
-            throw 'Unable to decode PDF data returned by API.'
+        if ($bodyText) {
+            $sanitised = $bodyText.Trim('"').Replace("`n", '').Replace("`r", '')
+            try {
+                $pdfBytes = [System.Convert]::FromBase64String($sanitised)
+            }
+            catch {
+                throw 'Unable to decode PDF data returned by GET API.'
+            }
         }
     }
 
@@ -172,14 +231,17 @@ if ($ApiUrl) {
         }
     }
 
-    if (-not $pdfBytes) {
-        throw 'API response did not contain any PDF data.'
+    if (-not $pdfBytes -or -not $pdfBytes.Length) {
+        Write-Warning 'GET API response did not contain PDF content yet.'
+        if ($DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+        continue
     }
 
     $outputPath = [System.IO.Path]::GetFullPath($OutputPdf)
     [System.IO.File]::WriteAllBytes($outputPath, $pdfBytes)
     Write-Host "Saved PDF to $outputPath"
-
     $targetHeader = $response.Headers['X-Conversion-Target']
     $sourceHeader = $response.Headers['X-Conversion-Source']
     if ($targetHeader) {
@@ -188,8 +250,11 @@ if ($ApiUrl) {
     if ($sourceHeader) {
         Write-Host "Source: $sourceHeader"
     }
+    $downloaded = $true
 }
 
-if (-not $ApiUrl -and -not $EventOutput) {
-    Write-Host $payloadJson
+if (-not $downloaded) {
+    throw "Conversion not completed after $MaxAttempts polling attempts. Result key: $resultId"
 }
+
+Write-Host "Result key: $resultId"

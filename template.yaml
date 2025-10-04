@@ -6,7 +6,6 @@ Description: >
 Globals:
   Function:
     Runtime: python3.13
-    Handler: app.lambda_handler
     Timeout: 180
     MemorySize: 256
     Architectures:
@@ -45,6 +44,12 @@ Parameters:
     Default: false
     Description: Toggle to force usage of the shared Adobe Python layer instead of the bundled layer.
 
+  DropzoneBucketName:
+    Type: String
+    Default: xlsx-to-pdf-dropzone
+    AllowedPattern: '^[A-Za-z0-9.-]{3,63}$'
+    Description: Name of the S3 bucket used to store XLSX uploads and converted PDFs.
+
 Conditions:
   UseExternalAdobeLayer: !Equals [!Ref UseSharedAdobePythonLayer, 'true']
 
@@ -78,22 +83,67 @@ Resources:
   XLSToPDFDropzoneBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: 'xlsx-to-pdf-dropzone'
+      BucketName: !Ref DropzoneBucketName
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
-  XLSToPDF:
+  XLSToPDFSubmitFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-xls-to-pdf
-      Description: Convert XLSX payloads to PDF using the Adobe web services toolkit either synchronously via API or asynchronously via SQS.
+      FunctionName: !Sub ${AWS::StackName}-submit
+      Description: Accept XLSX uploads, store them in the dropzone bucket, and return the polling key.
       CodeUri: src/
+      Handler: submit_handler.lambda_handler
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref XLSToPDFDropzoneBucket
+            BucketName: !Ref DropzoneBucketName
+      Environment:
+        Variables:
+          DEFAULT_TARGET_BUCKET: !Ref DropzoneBucketName
+      Events:
+        SubmitApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref XLSToPDFApi
+            Stage: !Ref ApiStage
+            Path: /submit
+            Method: post
+
+  XLSToPDFGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get
+      Description: Look up conversion results and return PDFs once available.
+      CodeUri: src/
+      Handler: get_handler.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DropzoneBucketName
+      Environment:
+        Variables:
+          DEFAULT_TARGET_BUCKET: !Ref DropzoneBucketName
+      Events:
+        GetApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref XLSToPDFApi
+            Stage: !Ref ApiStage
+            Path: /get
+            Method: get
+
+  XLSToPDFConvertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-convert
+      Description: Convert uploaded XLSX files to PDF and write completion markers.
+      CodeUri: src/
+      Handler: convert_handler.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DropzoneBucketName
         - Statement:
             - Effect: Allow
               Action:
@@ -103,26 +153,36 @@ Resources:
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PDFServicesClientSecretParameterPath}
       Environment:
         Variables:
-          DEFAULT_TARGET_BUCKET: !Ref XLSToPDFDropzoneBucket
+          DEFAULT_TARGET_BUCKET: !Ref DropzoneBucketName
           PDF_SERVICES_CLIENT_ID_PARAMETER: !Ref PDFServicesClientIdParameterPath
           PDF_SERVICES_CLIENT_SECRET_PARAMETER: !Ref PDFServicesClientSecretParameterPath
       Events:
-        ApiInvocation:
-          Type: Api
+        UploadTrigger:
+          Type: S3
           Properties:
-            RestApiId: !Ref XLSToPDFApi
-            Stage: !Ref ApiStage
-            Path: /xls-to-pdf
-            Method: post
+            Bucket: !Ref XLSToPDFDropzoneBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .xlsx
 
 Outputs:
-  ApiInvokeUrl:
-    Description: API endpoint for synchronous XLSX to PDF conversions.
+  SubmitApiInvokeUrl:
+    Description: API endpoint for submitting XLSX workbooks for conversion.
     Value:
       !Sub
-        - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/xls-to-pdf
+        - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/submit
+        - ApiId: !Ref XLSToPDFApi
+          Stage: !Ref ApiStage
+  GetApiInvokeUrl:
+    Description: API endpoint for retrieving the resulting PDF once conversion completes.
+    Value:
+      !Sub
+        - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/get
         - ApiId: !Ref XLSToPDFApi
           Stage: !Ref ApiStage
   ApiId:
-    Description: API Gateway ID backing the synchronous endpoint.
+    Description: API Gateway ID backing the asynchronous workflow.
     Value: !Ref XLSToPDFApi
