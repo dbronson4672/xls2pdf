@@ -8,7 +8,7 @@ Globals:
     Runtime: python3.13
     Handler: app.lambda_handler
     Timeout: 180
-    MemorySize: 2048
+    MemorySize: 256
     Architectures:
       - x86_64
     Tracing: Active

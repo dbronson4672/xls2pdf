@@ -54,6 +54,30 @@ function New-SqsEvent {
     return @{ Records = @($record) }
 }
 
+function Test-IsLikelyBase64Bytes {
+    param(
+        [byte[]]$Bytes
+    )
+
+    if (-not $Bytes -or -not $Bytes.Length) {
+        return $false
+    }
+
+    foreach ($b in $Bytes) {
+        if (($b -ge 48 -and $b -le 57) -or  # 0-9
+            ($b -ge 65 -and $b -le 90) -or  # A-Z
+            ($b -ge 97 -and $b -le 122) -or # a-z
+            $b -eq 43 -or $b -eq 47 -or     # + /
+            $b -eq 61 -or                   # =
+            $b -eq 10 -or $b -eq 13) {      # new lines
+            continue
+        }
+        return $false
+    }
+
+    return $true
+}
+
 if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
     throw "Input file '$InputFile' not found."
 }
@@ -103,8 +127,8 @@ if ($ApiUrl) {
     }
 
     Write-Host "Invoking API $ApiUrl"
+    # $response = Invoke-WebRequest -Verbose -Uri $ApiUrl -Method Post -ContentType 'application/json' -Body $payloadJson
     $response = Invoke-WebRequest -Uri $ApiUrl -Method Post -ContentType 'application/json' -Body $payloadJson
-
     $pdfBytes = $null
     $contentType = $response.Headers['Content-Type']
     if ($contentType -and $contentType[0] -like 'application/pdf*') {
@@ -134,6 +158,17 @@ if ($ApiUrl) {
         }
         catch {
             throw 'Unable to decode PDF data returned by API.'
+        }
+    }
+
+    if ($pdfBytes -and (Test-IsLikelyBase64Bytes -Bytes $pdfBytes)) {
+        $encodedText = [System.Text.Encoding]::ASCII.GetString($pdfBytes)
+        $sanitised = $encodedText.Trim('"').Replace("`n", '').Replace("`r", '')
+        try {
+            $pdfBytes = [System.Convert]::FromBase64String($sanitised)
+        }
+        catch {
+            throw 'Received base64-like response but decoding failed.'
         }
     }
 
