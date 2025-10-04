@@ -1,3 +1,4 @@
 .aws-sam/*
 .venv/*
 data/
+samconfig.toml
